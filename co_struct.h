@@ -3,24 +3,50 @@
 */
 
 #pragma once
-#include <stddef.h>
-#include <stdio.h>
-#include <cstring>
-#include <stdlib.h>
-#include <list>
-#include <vector>
-#include <sys/time.h>
-#include <memory>
 #include <cassert>
+#include <cstring>
+#include <list>
+#include <memory>
+#include <vector>
+#include <stdio.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <sys/time.h>
 #include <sys/poll.h>
+#include <sys/epoll.h>
+#include <unistd.h>
 
 typedef void (*co_func)(void *);
+
 typedef void* co_args;
 
 #define NODEBUG 1
 #define CO_STACK_SIZE (1024*10)
 #define MAX_SLOT_NUM_MS (1000*10)
 
+
+static uint32_t PollEvent2Epoll( short events )
+{
+	uint32_t e = 0;
+	if( events & POLLIN ) 	e |= EPOLLIN;
+	if( events & POLLOUT )  e |= EPOLLOUT;
+	if( events & POLLHUP ) 	e |= EPOLLHUP;
+	if( events & POLLERR )	e |= EPOLLERR;
+	if( events & POLLRDNORM ) e |= EPOLLRDNORM;
+	if( events & POLLWRNORM ) e |= EPOLLWRNORM;
+	return e;
+}
+static short EpollEvent2Poll( uint32_t events )
+{
+	short e = 0;
+	if( events & EPOLLIN ) 	e |= POLLIN;
+	if( events & EPOLLOUT ) e |= POLLOUT;
+	if( events & EPOLLHUP ) e |= POLLHUP;
+	if( events & EPOLLERR ) e |= POLLERR;
+	if( events & EPOLLRDNORM ) e |= POLLRDNORM;
+	if( events & EPOLLWRNORM ) e |= POLLWRNORM;
+	return e;
+}
 
 struct co_env;
 struct coctx_t
@@ -71,10 +97,15 @@ ull GetTimeStamp() {
 }
 
 void co_switch_to(co_struct *co);
+void co_onEventTrigger(void *vArgs);
+co_struct* get_curr_co();
+void co_switch_to(void *co_item);
+
 struct co_slot_item {
     // 作为一个定时器，需要记录超时时间，以及超时后的回调函数？（sleep也很常用，用poll实现）
     ull expireTimeStamp;
     co_func expireCallback; // 调用上面的switchto 直接Switch to原来的coroutine
+    co_func eventTriggerCallback;
     co_struct *co;
 };
 
@@ -133,9 +164,45 @@ void checkTimingWheel(co_timing_wheel *pTimingWheel) {
     printf("curSlot %d\n", pTimingWheel->curSlot);
     for (int i = 0; i < pTimingWheel->slotNum; ++i) {
         if (pTimingWheel->pSlots->at(i).size() > 0) {
-            printf("slot %d has %d items\n", i, pTimingWheel->pSlots->at(i).size());
+            printf("slot %d has %lu items\n", i, pTimingWheel->pSlots->at(i).size());
         }
     }
+}
+
+// 2 epoll 托管子poll请求，高效的很
+#define EPOLL_MAX_LENGTH 2048
+struct epoll_req_wrapper {
+    int epollFd;
+    epoll_event *events;
+};
+
+
+struct co_timed_poll : public co_slot_item {
+    int envEpollFd;
+
+    int nfds;
+    pollfd *events;
+
+    int nPrepared;     // 0
+    bool hasSubReqTrg;
+};
+
+struct co_poll_subreq {
+    co_timed_poll *pTimedPoll; // the main request
+    int idxInEvents;
+};
+
+void co_init_poll(co_timed_poll *cop, int epfd, pollfd *fds, int nfds, int timeout) {
+    cop->co = get_curr_co();
+    cop->envEpollFd = epfd;
+    cop->events = fds;
+    cop->nfds = nfds;
+    cop->nPrepared = 0;
+    cop->hasSubReqTrg = false;
+
+    cop->eventTriggerCallback = co_onEventTrigger;
+    cop->expireCallback = co_switch_to;
+    cop->expireTimeStamp = GetTimeStamp() + timeout;
 }
 
 struct co_env
@@ -143,7 +210,7 @@ struct co_env
 	co_struct *pCallStack[ 128 ]; // 这个callstack属实有点小了
 	int iCallStackSize;
     co_timing_wheel *pTimingWheel;
-	// stCoEpoll_t *pEpoll;
+    epoll_req_wrapper *pEpollIns;
 };
 
 
@@ -205,6 +272,7 @@ extern void coctx_swap(coctx_t*, coctx_t*) asm("coctx_swap"); // 寄存器操作
 
 //-------------
 
+// init data structure
 void co_struct_init(co_struct **pico, co_func func, co_args args) {
     co_struct *co = (co_struct*)calloc(1, sizeof(co_struct));
     co->func = func;
@@ -231,7 +299,6 @@ void co_timing_wheel_init(co_timing_wheel **tw) {
     t->pSlots.reset(new Slots(t->slotNum));
     *tw = t;
 }
-
 void co_timing_wheel_release(co_timing_wheel *tw) {
     delete tw;
 }
@@ -241,13 +308,24 @@ void co_global_init() {
     glbEnv.iCallStackSize = 1; // 默认有个全局env 也就是main
     co_struct_init(&glbEnv.pCallStack[0], NULL, NULL);
     co_timing_wheel_init(&glbEnv.pTimingWheel);
+    glbEnv.pEpollIns = (epoll_req_wrapper*)calloc(1, sizeof(epoll_req_wrapper));
+    glbEnv.pEpollIns->epollFd = epoll_create(1);
+    if (glbEnv.pEpollIns->epollFd < 0) {
+        perror("epoll_create"); exit(1);
+    }
+    glbEnv.pEpollIns->events = (epoll_event*)malloc(sizeof(epoll_event) * EPOLL_MAX_LENGTH);
+    if (glbEnv.pEpollIns->events == NULL) {
+        perror("malloc fail"); exit(1);
+    }
 }
-
 void co_global_release() {
     for (int i = 0; i < glbEnv.iCallStackSize; ++i) {
         co_struct_release(glbEnv.pCallStack[i]);
     }
     co_timing_wheel_release(glbEnv.pTimingWheel);
+    close(glbEnv.pEpollIns->epollFd);
+    free(glbEnv.pEpollIns->events);
+    free(glbEnv.pEpollIns);
 }
 
 void co_swap(co_struct *curr, co_struct *next) {
@@ -301,11 +379,33 @@ void co_yield() {
     co_swap( curr,next );
 }
 
-
+// call back function
 void co_switch_to(void *co_item) {
     co_slot_item *item = (co_slot_item*)co_item;
     co_resume(item->co);
 }
+
+struct EventTriggerArgs {
+    epoll_event ev;
+    co_poll_subreq *subreq;
+    std::list<co_slot_item> *mayTimeOut;
+};
+
+void co_onEventTrigger(void *vArgs) {
+    EventTriggerArgs *args = (EventTriggerArgs *)vArgs;
+    co_timed_poll *pMainPool = args->subreq->pTimedPoll;
+    // pollfd相应位置设置为ev的值
+    pMainPool->nPrepared ++;
+    pMainPool->events[args->subreq->idxInEvents].revents = args->ev.events;
+
+    if (!pMainPool->hasSubReqTrg) {
+        pMainPool->hasSubReqTrg = true;
+        (*args->mayTimeOut).push_back(*pMainPool);
+    }
+}
+
+
+//
 
 co_struct* get_curr_co() {
     return glbEnv.pCallStack[glbEnv.iCallStackSize - 1];
@@ -331,6 +431,39 @@ void co_sleep(ull ms) {
     co_yield();
 }
 
+int co_blocked_poll(struct pollfd fds[], nfds_t nfds, int timeout) {
+    // 只处理需要阻塞的情况，把这些poll请求放到全局的Epoll对象上
+    if (timeout <= 0) {
+        return 0;
+    }
+    int epfd = glbEnv.pEpollIns->epollFd;
+    co_timed_poll pollReq; // 总管这些poll请求
+    co_init_poll(&pollReq, epfd, fds, nfds, timeout);
+    co_poll_subreq *subreqs = (co_poll_subreq*)malloc(sizeof(co_poll_subreq) * nfds);
+    for (int i = 0; i < nfds; ++i) {
+        pollfd &pf = fds[i];
+        subreqs[i].idxInEvents = i;
+        subreqs[i].pTimedPoll = &pollReq;
+        epoll_event transEv;
+        transEv.events = PollEvent2Epoll(pf.events);
+        transEv.data.ptr = subreqs + i; // 放subreq
+        epoll_ctl(epfd, EPOLL_CTL_ADD, pf.fd, &transEv);
+    }
+    AddToTimingWheel(glbEnv.pTimingWheel, &pollReq, GetTimeStamp() + timeout);
+    co_yield(); // 让epoll等待好了在转回来
+
+    // 从epoll中删除这些fd，（结果在哪回填？）
+    for (int i = 0; i < nfds; ++i) {
+        pollfd &pf = fds[i];
+        int flag = epoll_ctl(epfd, EPOLL_CTL_DEL, pf.fd, NULL);
+        if (flag == -1) {
+            printf("Error epoll_ctl, errno = %s\n", strerror(errno));
+        }
+    }
+    free(subreqs);
+    return pollReq.nPrepared;
+}
+
 void co_eventloop() {
     // 事件循环
     while (true) {
@@ -340,6 +473,32 @@ void co_eventloop() {
         // 为什么说这个是mayExpired？因为时间轮算法中，如果等待时间是一个时间轮的周期，那么就会被放到下一个时间轮中，所以这里可能会有一些误差
         // checkTimingWheel(glbEnv.pTimingWheel);
         // poll(NULL, 0, 3000); // 3s
+        auto ep = glbEnv.pEpollIns;
+        int nTrig = epoll_wait(glbEnv.pEpollIns->epollFd, glbEnv.pEpollIns->events, EPOLL_MAX_LENGTH, 1);
+        if (nTrig > 0) {
+            auto evs = glbEnv.pEpollIns->events;
+            for (int i = 0; i < nTrig; ++i) {
+                co_poll_subreq *req = (co_poll_subreq *)evs[i].data.ptr;
+                co_timed_poll *mainReq = req->pTimedPoll;
+                // 规定epoll_event结果中的data指针指向一个sub poll request object, ctl注册时记得传参
+                if (mainReq->eventTriggerCallback) {
+                    // const epoll_event &ev, co_poll_subreq *subreq, std::list<co_slot_item>& mayTo
+                    EventTriggerArgs args {
+                            evs[i],
+                            req,
+                            &mayExpired
+                    };
+                    mainReq->eventTriggerCallback(&args);
+                } else {
+                    // 如果没有event trigger callback，那么就直接把结果放到mayExpired中
+                    mayExpired.push_back(*mainReq);
+                }
+            }
+        } else if (nTrig < 0) {
+            printf("Error epoll wait with %d, errno = %s\n", nTrig, strerror(errno));
+            exit(-1);
+        }
+
         ull now = GetTimeStamp();
         AdvanceToClearMayBeExpiredSlots(glbEnv.pTimingWheel, &mayExpired, now);
 
@@ -352,6 +511,10 @@ void co_eventloop() {
             continue;
         }
 #endif
+        for (auto &item : mayExpired) {
+            // 由于有sub event，需要特殊处理一下
+
+        }
 
         for (auto &item : mayExpired) {
             if (item.expireTimeStamp <= now) {
@@ -362,7 +525,12 @@ void co_eventloop() {
                 AddToTimingWheel(glbEnv.pTimingWheel, &item, now);
             }
         }
-        // 2. 执行事件
+        // 2. 执行事件,这需要用Epoll高效的等待多种阻塞事件
+        //    这部分逻辑：如果要执行一个阻塞的函数（like Poll），我们重新定义这个函数
+        //                   用我们得全局Epoll管理操作涉及的文件描述符（linux很多东西都能包装成fd，定时器啥的）让Epoll去等待
+        //               处理两种返回情况？1. 超时，添加到时间轮里了，它会执行回调函数
+        //                          2. 有事件发生（这种情况有点复杂，一次Poll会监听多个fd，这么多个只要有一个准备好了，就去删除1的超时回调
+
         // 3. 执行协程
     }
 }
