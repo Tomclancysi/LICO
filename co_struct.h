@@ -1,7 +1,6 @@
 /**
  * 写法参考了 https://github.com/Tencent/libco，但是仅保留其中重要的部分
 */
-
 #pragma once
 #include <cassert>
 #include <cstring>
@@ -17,10 +16,10 @@
 #include <unistd.h>
 
 typedef void (*co_func)(void *);
-
 typedef void* co_args;
+typedef unsigned long long ull;
 
-#define NODEBUG 1
+#define DEBUG 1
 #define CO_STACK_SIZE (1024*10)
 #define MAX_SLOT_NUM_MS (1000*10)
 
@@ -52,10 +51,8 @@ struct co_env;
 struct coctx_t
 { // x_86_64汇编
 	void *regs[ 14 ]; // 这个数组还牵扯到汇编以及内存布局，非常detail。一个struct内部每一项的位置是什么？
-
 	[[maybe_unused]] size_t ss_size; // 参考libco的，但这两个作用不太清楚，应该共享栈才需要
 	[[maybe_unused]] char *ss_sp;
-
 };
 
 struct co_stack
@@ -80,15 +77,8 @@ struct co_struct
 
 };
 
-struct co_epoll_ctl
-{ // 通过hook各种可能阻塞的操作，用epoll管理，来实现协程的调度
-    int iEpollFd;
-    // 需要维护fd和协程的映射关系（还需要管理这个协程的生命周期吗？）
-};
-
 // 1. 时间轮，处理定时任务
 // 拆分任务，时间轮需要处理的任务有：
-typedef unsigned long long ull;
 
 ull GetTimeStamp() {
     struct timeval now = {0};
@@ -96,10 +86,14 @@ ull GetTimeStamp() {
     return now.tv_sec * 1000 + now.tv_usec / 1000;
 }
 
-void co_switch_to(co_struct *co);
-void co_onEventTrigger(void *vArgs);
 co_struct* get_curr_co();
+void onEventTrigger(void *vArgs);
 void co_switch_to(void *co_item);
+
+ull GetExpiredSlotId() {
+    static ull id = 0;
+    return ++id;
+}
 
 struct co_slot_item {
     // 作为一个定时器，需要记录超时时间，以及超时后的回调函数？（sleep也很常用，用poll实现）
@@ -107,7 +101,17 @@ struct co_slot_item {
     co_func expireCallback; // 调用上面的switchto 直接Switch to原来的coroutine
     co_func eventTriggerCallback;
     co_struct *co;
+    int slotIndex; // 用于删除指定的slot
+    ull id;
 };
+
+void coInitSlot(co_slot_item *item, ull expiredTime) {
+    item->co = get_curr_co();
+    item->expireTimeStamp = expiredTime;
+    item->expireCallback = co_switch_to;
+    item->id = GetExpiredSlotId();
+    item->slotIndex = -1;
+}
 
 typedef std::vector<std::list<co_slot_item>> Slots;
 struct co_timing_wheel {
@@ -157,7 +161,20 @@ bool AddToTimingWheel(co_timing_wheel *pTimingWheel, co_slot_item *pSlotItem, ul
     }
     int slotIndex = (curSlot + diff) % slotNum;
     (*pTimingWheel->pSlots)[slotIndex].push_back(*pSlotItem);
+    pSlotItem->slotIndex = slotIndex;
     return true;
+}
+
+void RemoveFromTimingWheel(co_timing_wheel *pTimingWheel, co_slot_item *pSlotItem) {
+    auto &targetList = pTimingWheel->pSlots->at(pSlotItem->slotIndex);
+    auto iter = targetList.begin();
+    while (iter != targetList.end()) {
+        if (iter->id == pSlotItem->id) {
+            targetList.erase(iter);
+            break;
+        }
+        ++iter;
+    }
 }
 
 void checkTimingWheel(co_timing_wheel *pTimingWheel) {
@@ -192,17 +209,15 @@ struct co_poll_subreq {
     int idxInEvents;
 };
 
-void co_init_poll(co_timed_poll *cop, int epfd, pollfd *fds, int nfds, int timeout) {
-    cop->co = get_curr_co();
+void coInitPoll(co_timed_poll *cop, int epfd, pollfd *fds, int nfds, int timeout) {
+    coInitSlot(cop, GetTimeStamp() + timeout);
+
     cop->envEpollFd = epfd;
     cop->events = fds;
     cop->nfds = nfds;
     cop->nPrepared = 0;
     cop->hasSubReqTrg = false;
-
-    cop->eventTriggerCallback = co_onEventTrigger;
-    cop->expireCallback = co_switch_to;
-    cop->expireTimeStamp = GetTimeStamp() + timeout;
+    cop->eventTriggerCallback = onEventTrigger;
 }
 
 struct co_env
@@ -253,25 +268,7 @@ extern "C" {
 extern void coctx_swap(coctx_t*, coctx_t*) asm("coctx_swap"); // 寄存器操作:esp
 };
 
-// int coctx_make(coctx_t* ctx, co_func pfn/*回退函数*/, const void* s, const void* s1) {
-//   char* sp = ctx->ss_sp + ctx->ss_size - sizeof(void*); // 第一次执行的时候,将contex设置了返回地址是一个yield函数
-//   sp = (char*)((unsigned long)sp & -16LL); // 应该是为了对齐
-
-//   memset(ctx->regs, 0, sizeof(ctx->regs));
-//   void** ret_addr = (void**)(sp); // sp指向一个void*
-//   *ret_addr = (void*)pfn;
-
-//   ctx->regs[kRSP] = sp;
-
-//   ctx->regs[kRETAddr] = (char*)pfn;
-
-//   ctx->regs[kRDI] = (char*)s; // 返回地址那个函数对应的参数,汇编这边不太清楚
-//   ctx->regs[kRSI] = (char*)s1; // 入参
-//   return 0;
-// }
-
 //-------------
-
 // init data structure
 void co_struct_init(co_struct **pico, co_func func, co_args args) {
     co_struct *co = (co_struct*)calloc(1, sizeof(co_struct));
@@ -291,7 +288,7 @@ void co_struct_release(co_struct *co) {
     free(co);
 }
 
-void co_timing_wheel_init(co_timing_wheel **tw) {
+void coInitTimingWheel(co_timing_wheel **tw) {
     co_timing_wheel *t = new co_timing_wheel;
     t->slotNum = MAX_SLOT_NUM_MS;
     t->curSlot = 0;
@@ -299,7 +296,7 @@ void co_timing_wheel_init(co_timing_wheel **tw) {
     t->pSlots.reset(new Slots(t->slotNum));
     *tw = t;
 }
-void co_timing_wheel_release(co_timing_wheel *tw) {
+void coReleaseTimingWheel(co_timing_wheel *tw) {
     delete tw;
 }
 
@@ -307,7 +304,7 @@ void co_global_init() {
     memset(&glbEnv, 0, sizeof(glbEnv));
     glbEnv.iCallStackSize = 1; // 默认有个全局env 也就是main
     co_struct_init(&glbEnv.pCallStack[0], NULL, NULL);
-    co_timing_wheel_init(&glbEnv.pTimingWheel);
+    coInitTimingWheel(&glbEnv.pTimingWheel);
     glbEnv.pEpollIns = (epoll_req_wrapper*)calloc(1, sizeof(epoll_req_wrapper));
     glbEnv.pEpollIns->epollFd = epoll_create(1);
     if (glbEnv.pEpollIns->epollFd < 0) {
@@ -322,27 +319,27 @@ void co_global_release() {
     for (int i = 0; i < glbEnv.iCallStackSize; ++i) {
         co_struct_release(glbEnv.pCallStack[i]);
     }
-    co_timing_wheel_release(glbEnv.pTimingWheel);
+    coReleaseTimingWheel(glbEnv.pTimingWheel);
     close(glbEnv.pEpollIns->epollFd);
     free(glbEnv.pEpollIns->events);
     free(glbEnv.pEpollIns);
 }
 
-void co_swap(co_struct *curr, co_struct *next) {
+void coSwap(co_struct *curr, co_struct *next) {
     // 一个神奇的函数，直接就把当前的上下文切换到next的上下文
 
     coctx_swap(curr->ctx, next->ctx); // 此时函数已经到next中继续运行了，如何回到这个地址？
 
 }
 
-void co_finish() { // 如果协程函数执行完毕，ret会返回到这个函数的地址上，从而swap到协程的父协程
+void coFinish() { // 如果协程函数执行完毕，ret会返回到这个函数的地址上，从而swap到协程的父协程
     co_struct *curr = glbEnv.pCallStack[glbEnv.iCallStackSize-1];
     co_struct *next = glbEnv.pCallStack[glbEnv.iCallStackSize-2];
     // maybe need some garbage collection? maybe not
     glbEnv.iCallStackSize--;
     curr->isEnded = true;
 
-    co_swap(curr, next);
+    coSwap(curr, next);
 }
 
 void co_resume(co_struct *co) {
@@ -353,7 +350,7 @@ void co_resume(co_struct *co) {
 
         // RBP RSP应该设置为正确的堆栈地址,RBP前面应该留一个返回地址的位置，函数执行完之后返回到这个函数里，没有显示yield
         char *stBase = (char*)( (u_int64_t)(&co->stack->stack_buffer[CO_STACK_SIZE-1]) & (-16LL) );
-        *((u_int64_t*)stBase + 1) = (u_int64_t)co_finish;
+        *((u_int64_t*)stBase + 1) = (u_int64_t)coFinish;
         co->ctx->regs[kRBP] = stBase;
         co->ctx->regs[kRSP] = stBase; // 这个函数的返回地址已经被安排了
 
@@ -367,7 +364,7 @@ void co_resume(co_struct *co) {
     co_struct *curr = glbEnv.pCallStack[glbEnv.iCallStackSize - 1];
     glbEnv.pCallStack[glbEnv.iCallStackSize++] = co;
 
-    co_swap( curr,co );
+    coSwap( curr,co );
 }
 
 void co_yield() {
@@ -376,7 +373,7 @@ void co_yield() {
     co_struct *next = glbEnv.pCallStack[glbEnv.iCallStackSize - 2];
     glbEnv.iCallStackSize--;
 
-    co_swap( curr,next );
+    coSwap( curr,next );
 }
 
 // call back function
@@ -391,25 +388,26 @@ struct EventTriggerArgs {
     std::list<co_slot_item> *mayTimeOut;
 };
 
-void co_onEventTrigger(void *vArgs) {
+void onEventTrigger(void *vArgs) { // **************************************************
     EventTriggerArgs *args = (EventTriggerArgs *)vArgs;
     co_timed_poll *pMainPool = args->subreq->pTimedPoll;
     // pollfd相应位置设置为ev的值
-    pMainPool->nPrepared ++;
-    pMainPool->events[args->subreq->idxInEvents].revents = args->ev.events;
+
+    pMainPool->events[args->subreq->idxInEvents].revents = EpollEvent2Poll(args->ev.events);
+
 
     if (!pMainPool->hasSubReqTrg) {
+        pMainPool->nPrepared ++;
         pMainPool->hasSubReqTrg = true;
         (*args->mayTimeOut).push_back(*pMainPool);
+        RemoveFromTimingWheel(glbEnv.pTimingWheel, pMainPool);
     }
 }
-
-
-//
 
 co_struct* get_curr_co() {
     return glbEnv.pCallStack[glbEnv.iCallStackSize - 1];
 }
+
 
 void co_sleep(ull ms) {
     // 往时间轮中添加一个定时器，把当前协程挂起(struct最好用仅包含指针的struct，这样拷贝起来也轻量)
@@ -424,9 +422,7 @@ void co_sleep(ull ms) {
         printf("Error add to timing wheel\n");
         return;
     } else {
-#ifdef DEBUG
-        printf("Add to timing wheel\n");
-#endif
+        // maybe log is needed
     }
     co_yield();
 }
@@ -438,18 +434,18 @@ int co_blocked_poll(struct pollfd fds[], nfds_t nfds, int timeout) {
     }
     int epfd = glbEnv.pEpollIns->epollFd;
     co_timed_poll pollReq; // 总管这些poll请求
-    co_init_poll(&pollReq, epfd, fds, nfds, timeout);
+    coInitPoll(&pollReq, epfd, fds, nfds, timeout);
     co_poll_subreq *subreqs = (co_poll_subreq*)malloc(sizeof(co_poll_subreq) * nfds);
     for (int i = 0; i < nfds; ++i) {
-        pollfd &pf = fds[i];
         subreqs[i].idxInEvents = i;
         subreqs[i].pTimedPoll = &pollReq;
         epoll_event transEv;
+        pollfd &pf = fds[i];
         transEv.events = PollEvent2Epoll(pf.events);
         transEv.data.ptr = subreqs + i; // 放subreq
         epoll_ctl(epfd, EPOLL_CTL_ADD, pf.fd, &transEv);
     }
-    AddToTimingWheel(glbEnv.pTimingWheel, &pollReq, GetTimeStamp() + timeout);
+    AddToTimingWheel(glbEnv.pTimingWheel, &pollReq, GetTimeStamp());
     co_yield(); // 让epoll等待好了在转回来
 
     // 从epoll中删除这些fd，（结果在哪回填？）
@@ -476,16 +472,16 @@ void co_eventloop() {
         auto ep = glbEnv.pEpollIns;
         int nTrig = epoll_wait(glbEnv.pEpollIns->epollFd, glbEnv.pEpollIns->events, EPOLL_MAX_LENGTH, 1);
         if (nTrig > 0) {
-            auto evs = glbEnv.pEpollIns->events;
+            epoll_event *epoll_events = glbEnv.pEpollIns->events;
             for (int i = 0; i < nTrig; ++i) {
-                co_poll_subreq *req = (co_poll_subreq *)evs[i].data.ptr;
-                co_timed_poll *mainReq = req->pTimedPoll;
+                co_poll_subreq *subreq = (co_poll_subreq *)epoll_events[i].data.ptr;
+                co_timed_poll *mainReq = subreq->pTimedPoll;
                 // 规定epoll_event结果中的data指针指向一个sub poll request object, ctl注册时记得传参
                 if (mainReq->eventTriggerCallback) {
                     // const epoll_event &ev, co_poll_subreq *subreq, std::list<co_slot_item>& mayTo
                     EventTriggerArgs args {
-                            evs[i],
-                            req,
+                            epoll_events[i],
+                            subreq,
                             &mayExpired
                     };
                     mainReq->eventTriggerCallback(&args);
@@ -507,17 +503,13 @@ void co_eventloop() {
         if (mayExpired.size() == 0) {
             // 没有超时的，那么就等待一下
             printf("\nwait\n");
-            poll(NULL, 0, 3000);
+            poll(NULL, 0, 500);
             continue;
         }
 #endif
-        for (auto &item : mayExpired) {
-            // 由于有sub event，需要特殊处理一下
-
-        }
 
         for (auto &item : mayExpired) {
-            if (item.expireTimeStamp <= now) {
+            if (item.expireTimeStamp <= now || item.eventTriggerCallback != NULL) {
                 // 超时之后执行一个函数,这个函数是写死还是灵活?
                 item.expireCallback((void*)&item); // 超时了应该返回原来的那个协程？
             } else {
