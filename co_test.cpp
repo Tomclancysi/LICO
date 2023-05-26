@@ -26,12 +26,12 @@ void callee(void *o) {
 void caller() {
     struct obj o;
     co_struct *subrt = NULL;
-    co_struct_init(&subrt, callee, &o);
+    co_create(&subrt, callee, &o);
     for (int i = 0; i < 10; i++) { // 如果循环次数大于callee的生成次数就会出错，callee可以设置成无限循环
         co_resume(subrt);
         printf("caller get %d\n", o.x);
     }
-    co_struct_release(subrt);
+    co_release(subrt);
 }
 
 int main() {

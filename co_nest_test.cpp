@@ -12,7 +12,7 @@ void nest_func(co_args level) {
 
     struct co_struct *co = NULL;
     int nxt_level = le + 1;
-    co_struct_init(&co, nest_func, co_args(&nxt_level));
+    co_create(&co, nest_func, co_args(&nxt_level));
     co_resume(co);
 
     printf("level %d\n", le);

@@ -38,9 +38,9 @@ int main() {
     co_global_init();
 
     struct co_struct *co1 = NULL;
-    co_struct_init(&co1, func1, NULL);
+    co_create(&co1, func1, NULL);
     struct co_struct *co2 = NULL;
-    co_struct_init(&co2, func2, NULL);
+    co_create(&co2, func2, NULL);
     co_resume(co1);
     co_resume(co2);
 
