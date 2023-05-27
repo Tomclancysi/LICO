@@ -14,6 +14,7 @@
 #include <sys/poll.h>
 #include <sys/epoll.h>
 #include <unistd.h>
+#include <functional>
 
 typedef void (*co_func)(void *);
 typedef void* co_args;
@@ -75,6 +76,14 @@ struct co_struct
     bool isStarted;
     bool isEnded;
 
+};
+
+struct co_condition_variable {
+    std::list<co_struct*> _waitingCoList;
+    int wait(std::function<bool()> predicate);
+    int wait_for(std::function<bool()> predicate, ull ms);
+    void notify_one();
+    void notify_all();
 };
 
 

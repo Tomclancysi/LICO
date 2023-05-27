@@ -144,9 +144,48 @@ struct CoEnvir
     TimeWheel *pTimingWheel;
     EpollRequest *pEpollIns;
 };
-
-// 3. CO conddition variable，协程之间的条件变量
 static CoEnvir GlobalEnv;
+
+// 3. Condition Variable,用于同步多个协程，实现wait wait_for notify_one notify_all
+
+int co_condition_variable::wait(std::function<bool()> predicate) {
+    // wait 判断条件是否满足，不满足时候，yield给其他协程，等待notify
+    while (!predicate()) {
+        _waitingCoList.push_back(GetCurrentCo());
+        co_yield();
+    }
+    return 0; // 0正常 -1超时
+}
+int co_condition_variable::wait_for(std::function<bool()> predicate, ull ms) {
+    ull now = GetTimeStamp();
+    TimeWheelSlot tws;
+    InitTWSlot(&tws, now + ms);
+    AddToTimingWheel(GlobalEnv.pTimingWheel, &tws, now);
+    while (!predicate()) {
+        _waitingCoList.push_back(GetCurrentCo());
+        co_yield();
+        if (GetTimeStamp() >= tws.expireTimeStamp) {
+            break;
+        }
+    }
+    RemoveFromTimingWheel(GlobalEnv.pTimingWheel, &tws);
+    return predicate() ? 0 : -1;
+}
+void co_condition_variable::notify_one() {
+    if (!_waitingCoList.empty()) {
+        co_struct *co = _waitingCoList.front();
+        _waitingCoList.pop_front();
+        co_resume(co);
+    }
+}
+void co_condition_variable::notify_all() {
+    // 这有坑的需要遍历list，但是遍历过程中转让了控制权，期间list会被修改的。直接转移
+    std::list<co_struct*> copy;
+    copy.swap(_waitingCoList);
+    for (auto co : copy) {
+        co_resume(co);
+    }
+}
 
 enum {
   kRBP = 6, // 为什么libco没设置rbp
@@ -299,7 +338,6 @@ void co_sleep(ull ms) {
     // 如果是main协程，那么就直接sleep，不需要挂起
     TimeWheelSlot item;
     auto now = GetTimeStamp();
-
     item.co = GetCurrentCo();
     item.expireCallback = TransferTo;
     item.expireTimeStamp = now + ms;

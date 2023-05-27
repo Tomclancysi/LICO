@@ -62,6 +62,10 @@ int main() {
         co_resume(cos[i]);
     }
 
+    // 释放
+    for (int i = 0; i < 100; ++i) {
+        co_release(cos[i]);
+    }
     co_eventloop();
     co_global_release();
 }
